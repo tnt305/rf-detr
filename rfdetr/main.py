@@ -153,7 +153,11 @@ class Model:
         self.stop_early = True
         print("Early stopping requested, will complete current epoch and stop")
 
-    def train(self, callbacks: DefaultDict[str, List[Callable]], **kwargs):
+    def train(self, callbacks: DefaultDict[str, List[Callable]] = None, **kwargs):
+        # ← THÊM: Default callbacks nếu None
+        if callbacks is None:
+            callbacks = defaultdict(list)
+        
         currently_supported_callbacks = ["on_fit_epoch_end", "on_train_batch_start", "on_train_end"]
         for key in callbacks.keys():
             if key not in currently_supported_callbacks:
@@ -161,14 +165,24 @@ class Model:
                     f"Callback {key} is not currently supported, please file an issue if you need it!\n"
                     f"Currently supported callbacks: {currently_supported_callbacks}"
                 )
+        
         args = populate_args(**kwargs)
-        if getattr(args, 'class_names') is not None:
+        if getattr(args, 'class_names', None) is not None:
             self.args.class_names = args.class_names
             self.args.num_classes = args.num_classes
-
+    
+        # ← THÊM: Khởi tạo distributed mode
         utils.init_distributed_mode(args)
+        
         print("git:\n  {}\n".format(utils.get_sha()))
         print(args)
+        
+        # ← THÊM: In thông tin distributed
+        if args.distributed:
+            print(f"Distributed training enabled: rank={args.rank}, world_size={args.world_size}")
+        else:
+            print("Running in single-GPU mode")
+        
         device = torch.device(args.device)
         
         # fix the seed for reproducibility
@@ -176,37 +190,46 @@ class Model:
         torch.manual_seed(seed)
         np.random.seed(seed)
         random.seed(seed)
-
+    
         criterion, postprocess = build_criterion_and_postprocessors(args)
         model = self.model
         model.to(device)
-
+    
         model_without_ddp = model
+        
+        # ← THÊM: Wrap model với DDP nếu distributed
         if args.distributed:
             if args.sync_bn:
+                print("Converting model to use SyncBatchNorm")
                 model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+            
+            print(f"Wrapping model with DistributedDataParallel on GPU {args.gpu}")
+            model = torch.nn.parallel.DistributedDataParallel(
+                model, 
+                device_ids=[args.gpu], 
+                find_unused_parameters=True
+            )
             model_without_ddp = model.module
-
+    
         n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print('number of params:', n_parameters)
         param_dicts = get_param_dict(args, model_without_ddp)
-
+    
         param_dicts = [p for p in param_dicts if p['params'].requires_grad]
-
+    
         optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, 
                                     weight_decay=args.weight_decay)
-        # Choose the learning rate scheduler based on the new argument
-
+    
         dataset_train = build_dataset(image_set='train', args=args, resolution=args.resolution)
         dataset_val = build_dataset(image_set='val', args=args, resolution=args.resolution)
         dataset_test = build_dataset(image_set='test' if args.dataset_file == "roboflow" else "val", args=args, resolution=args.resolution)
-
+    
         # for cosine annealing, calculate total training steps and warmup steps
         total_batch_size_for_lr = args.batch_size * utils.get_world_size() * args.grad_accum_steps
         num_training_steps_per_epoch_lr = (len(dataset_train) + total_batch_size_for_lr - 1) // total_batch_size_for_lr
         total_training_steps_lr = num_training_steps_per_epoch_lr * args.epochs
         warmup_steps_lr = num_training_steps_per_epoch_lr * args.warmup_epochs
+        
         def lr_lambda(current_step: int):
             if current_step < warmup_steps_lr:
                 # Linear warmup
@@ -221,9 +244,12 @@ class Model:
                         return 1.0
                     else:
                         return 0.1
+        
         lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
-
+    
+        # ← THAY ĐỔI: Sử dụng DistributedSampler khi distributed=True
         if args.distributed:
+            print("Using DistributedSampler for data loading")
             sampler_train = DistributedSampler(dataset_train)
             sampler_val = DistributedSampler(dataset_val, shuffle=False)
             sampler_test = DistributedSampler(dataset_test, shuffle=False)
@@ -231,9 +257,10 @@ class Model:
             sampler_train = torch.utils.data.RandomSampler(dataset_train)
             sampler_val = torch.utils.data.SequentialSampler(dataset_val)
             sampler_test = torch.utils.data.SequentialSampler(dataset_test)
-
+    
         effective_batch_size = args.batch_size * args.grad_accum_steps
         min_batches = kwargs.get('min_batches', 5)
+        
         if len(dataset_train) < effective_batch_size * min_batches:
             logger.info(
                 f"Training with uniform sampler because dataset is too small: {len(dataset_train)} < {effective_batch_size * min_batches}"
@@ -266,18 +293,18 @@ class Model:
         data_loader_test = DataLoader(dataset_test, args.batch_size, sampler=sampler_test,
                                     drop_last=False, collate_fn=utils.collate_fn, 
                                     num_workers=args.num_workers)
-
+    
         base_ds = get_coco_api_from_dataset(dataset_val)
         base_ds_test = get_coco_api_from_dataset(dataset_test)
+        
         if args.use_ema:
             self.ema_m = ModelEma(model_without_ddp, decay=args.ema_decay, tau=args.ema_tau)
         else:
             self.ema_m = None
-
-
+    
         output_dir = Path(args.output_dir)
         
-        if  utils.is_main_process():
+        if utils.is_main_process():
             print("Get benchmark")
             if args.do_benchmark:
                 benchmark_model = copy.deepcopy(model_without_ddp)
@@ -298,7 +325,7 @@ class Model:
                 optimizer.load_state_dict(checkpoint['optimizer'])
                 lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
                 args.start_epoch = checkpoint['epoch'] + 1
-
+    
         if args.eval:
             test_stats, coco_evaluator = evaluate(
                 model, criterion, postprocess, data_loader_val, base_ds, device, args)
@@ -318,12 +345,13 @@ class Model:
                 args.dropout, args.epochs, num_training_steps_per_epoch,
                 args.cutoff_epoch, args.drop_mode, args.drop_schedule)
             print("Min DO = %.7f, Max DO = %.7f" % (min(schedules['do']), max(schedules['do'])))
-
+    
         if args.drop_path > 0:
             schedules['dp'] = drop_scheduler(
                 args.drop_path, args.epochs, num_training_steps_per_epoch,
                 args.cutoff_epoch, args.drop_mode, args.drop_schedule)
             print("Min DP = %.7f, Max DP = %.7f" % (min(schedules['dp']), max(schedules['dp'])))
+        
         print("Start training")
         start_time = time.time()
         best_map_holder = BestMetricHolder(use_ema=args.use_ema)
@@ -331,11 +359,14 @@ class Model:
         best_map_50 = 0
         best_map_ema_5095 = 0
         best_map_ema_50 = 0
+        
         for epoch in range(args.start_epoch, args.epochs):
             epoch_start_time = time.time()
+            
+            # ← THÊM: Set epoch cho DistributedSampler
             if args.distributed:
                 sampler_train.set_epoch(epoch)
-
+    
             model.train()
             criterion.train()
             train_stats = train_one_epoch(
@@ -343,13 +374,16 @@ class Model:
                 effective_batch_size, args.clip_max_norm, ema_m=self.ema_m, schedules=schedules, 
                 num_training_steps_per_epoch=num_training_steps_per_epoch,
                 vit_encoder_num_layers=args.vit_encoder_num_layers, args=args, callbacks=callbacks)
+            
             train_epoch_time = time.time() - epoch_start_time
             train_epoch_time_str = str(datetime.timedelta(seconds=int(train_epoch_time)))
+            
             if args.output_dir:
                 checkpoint_paths = [output_dir / 'checkpoint.pth']
                 # extra checkpoint before LR drop and every `checkpoint_interval` epochs
                 if (epoch + 1) % args.lr_drop == 0 or (epoch + 1) % args.checkpoint_interval == 0:
                     checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')
+                
                 for checkpoint_path in checkpoint_paths:
                     weights = {
                         'model': model_without_ddp.state_dict(),
@@ -363,19 +397,19 @@ class Model:
                             'ema_model': self.ema_m.module.state_dict(),
                         })
                     if not args.dont_save_weights:
-                        # create checkpoint dir
                         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-                        
                         utils.save_on_master(weights, checkpoint_path)
-
+    
             with torch.inference_mode():
                 test_stats, coco_evaluator = evaluate(
                     model, criterion, postprocess, data_loader_val, base_ds, device, args=args
                 )
+            
             if not args.segmentation_head:
                 map_regular = test_stats["coco_eval_bbox"][0]
             else:
                 map_regular = test_stats["coco_eval_masks"][0]
+            
             _isbest = best_map_holder.update(map_regular, epoch, is_ema=False)
             if _isbest:
                 best_map_5095 = max(best_map_5095, map_regular)
@@ -393,10 +427,12 @@ class Model:
                         'epoch': epoch,
                         'args': args,
                     }, checkpoint_path)
+            
             log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                         **{f'test_{k}': v for k, v in test_stats.items()},
                         'epoch': epoch,
                         'n_parameters': n_parameters}
+            
             if args.use_ema:
                 ema_test_stats, _ = evaluate(
                     self.ema_m.module, criterion, postprocess, data_loader_val, base_ds, device, args=args
@@ -423,6 +459,7 @@ class Model:
                             'epoch': epoch,
                             'args': args,
                         }, checkpoint_path)
+            
             log_stats.update(best_map_holder.summary())
             
             # epoch parameters
@@ -439,10 +476,11 @@ class Model:
             epoch_time = time.time() - epoch_start_time
             epoch_time_str = str(datetime.timedelta(seconds=int(epoch_time)))
             log_stats['epoch_time'] = epoch_time_str
+            
             if args.output_dir and utils.is_main_process():
                 with (output_dir / "log.txt").open("a") as f:
                     f.write(json.dumps(log_stats) + "\n")
-
+    
                 # for evaluation logs
                 if coco_evaluator is not None:
                     (output_dir / 'eval').mkdir(exist_ok=True)
@@ -457,15 +495,14 @@ class Model:
                             else:
                                 torch.save(coco_evaluator.coco_eval["segm"].eval,
                                     output_dir / "eval" / name)
-
-            
+    
             for callback in callbacks["on_fit_epoch_end"]:
                 callback(log_stats)
-
+    
             if self.stop_early:
                 print(f"Early stopping requested, stopping at epoch {epoch}")
                 break
-
+    
         best_is_ema = best_map_ema_5095 > best_map_5095
         
         if utils.is_main_process():
@@ -481,31 +518,26 @@ class Model:
                 results = ema_test_stats["results_json"]
             else:
                 results = test_stats["results_json"]
-
+    
             class_map = results["class_map"]
             results["class_map"] = {"valid": class_map}
             with open(output_dir / "results.json", "w") as f:
                 json.dump(results, f)
-
+    
             total_time = time.time() - start_time
             total_time_str = str(datetime.timedelta(seconds=int(total_time)))
             print('Training time {}'.format(total_time_str))
             print('Results saved to {}'.format(output_dir / "results.json"))
             
-        
         if best_is_ema:
             self.model = self.ema_m.module
         self.model.eval()
-
-        if args.run_test:
-            time.sleep(5)
-            checkpoint = torch.load(output_dir / 'checkpoint_best_total.pth', map_location='cpu', weights_only=False)
-            best_state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
     
-            # Load into the unwrapped model to match non-DDP-saved checkpoint keys
-            model.module.load_state_dict(best_state_dict)
+        if args.run_test:
+            best_state_dict = torch.load(output_dir / 'checkpoint_best_total.pth', map_location='cpu', weights_only=False)['model']
+            model.load_state_dict(best_state_dict)
             model.eval()
-
+    
             test_stats, _ = evaluate(
                 model, criterion, postprocess, data_loader_test, base_ds_test, device, args=args
             )
@@ -516,7 +548,7 @@ class Model:
             results["class_map"]["test"] = test_metrics
             with open(output_dir / "results.json", "w") as f:
                 json.dump(results, f)
-
+    
         for callback in callbacks["on_train_end"]:
             callback()
     
