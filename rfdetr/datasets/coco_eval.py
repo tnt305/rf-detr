@@ -57,7 +57,37 @@ class CocoEvaluator(object):
             # suppress pycocotools prints
             with open(os.devnull, 'w') as devnull:
                 with contextlib.redirect_stdout(devnull):
-                    coco_dt = COCO.loadRes(self.coco_gt, results) if results else COCO()
+                    try:
+                        coco_dt = COCO.loadRes(self.coco_gt, results) if results else COCO()
+                        
+                        # Kiểm tra info và licenses
+                        if not hasattr(coco_dt, 'dataset') or 'info' not in coco_dt.dataset:
+                            if not hasattr(coco_dt, 'dataset'):
+                                coco_dt.dataset = {}
+                            coco_dt.dataset['info'] = {
+                                "description": "Auto-added info",
+                                "version": "1.0",
+                                "year": 2025,
+                                "contributor": "Auto",
+                                "date_created": "2025-11-16"
+                            }
+                            coco_dt.dataset['licenses'] = []
+                    
+                    except KeyError as e:
+                        if "'info'" in str(e) or "'licenses'" in str(e):
+                            print(f"KeyError {e} caught. Auto-adding 'info' and 'licenses'.")
+                            # Tạo COCO rỗng với info và licenses
+                            coco_dt = COCO()
+                            coco_dt.dataset['info'] = {
+                                "description": "Auto-added info",
+                                "version": "1.0",
+                                "year": 2025,
+                                "contributor": "Auto",
+                                "date_created": "2025-11-16"
+                            }
+                            coco_dt.dataset['licenses'] = []
+                        else:
+                            raise e
             coco_eval = self.coco_eval[iou_type]
 
             coco_eval.cocoDt = coco_dt
